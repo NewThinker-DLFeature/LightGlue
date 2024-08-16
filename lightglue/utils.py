@@ -3,6 +3,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple, Union
 
+import time
+from collections import OrderedDict
+from threading import Thread
+
 import cv2
 import kornia
 import numpy as np
@@ -163,3 +167,172 @@ def match_pair(
     # remove batch dim and move to target device
     feats0, feats1, matches01 = [batch_to_device(rbd(x), device) for x in data]
     return feats0, feats1, matches01
+
+
+def frame2tensor(frame, device):
+    return torch.from_numpy(frame/255.).float()[None, None].to(device)
+
+
+class AverageTimer:
+    """ Class to help manage printing simple timing of code execution. """
+
+    def __init__(self, smoothing=0.3, newline=False):
+        self.smoothing = smoothing
+        self.newline = newline
+        self.times = OrderedDict()
+        self.will_print = OrderedDict()
+        self.reset()
+
+    def reset(self):
+        now = time.time()
+        self.start = now
+        self.last_time = now
+        for name in self.will_print:
+            self.will_print[name] = False
+
+    def update(self, name='default'):
+        now = time.time()
+        dt = now - self.last_time
+        if name in self.times:
+            dt = self.smoothing * dt + (1 - self.smoothing) * self.times[name]
+        self.times[name] = dt
+        self.will_print[name] = True
+        self.last_time = now
+
+    def print(self, text='Timer'):
+        total = 0.
+        print('[{}]'.format(text), end=' ')
+        for key in self.times:
+            val = self.times[key]
+            if self.will_print[key]:
+                print('%s=%.3f' % (key, val), end=' ')
+                total += val
+        print('total=%.3f sec {%.1f FPS}' % (total, 1./total), end=' ')
+        if self.newline:
+            print(flush=True)
+        else:
+            print(end='\r', flush=True)
+        self.reset()
+
+class VideoStreamer:
+    """ Class to help process image streams. Four types of possible inputs:"
+        1.) USB Webcam.
+        2.) An IP camera
+        3.) A directory of images (files in directory matching 'image_glob').
+        4.) A video file, such as an .mp4 or .avi file.
+    """
+    def __init__(self, basedir, resize, skip, image_glob, max_length=1000000):
+        self._ip_grabbed = False
+        self._ip_running = False
+        self._ip_camera = False
+        self._ip_image = None
+        self._ip_index = 0
+        self.cap = []
+        self.camera = True
+        self.video_file = False
+        self.listing = []
+        self.resize = resize
+        self.interp = cv2.INTER_AREA
+        self.i = 0
+        self.skip = skip
+        self.max_length = max_length
+        if isinstance(basedir, int) or basedir.isdigit():
+            print('==> Processing USB webcam input: {}'.format(basedir))
+            self.cap = cv2.VideoCapture(int(basedir))
+            self.listing = range(0, self.max_length)
+        elif basedir.startswith(('http', 'rtsp')):
+            print('==> Processing IP camera input: {}'.format(basedir))
+            self.cap = cv2.VideoCapture(basedir)
+            self.start_ip_camera_thread()
+            self._ip_camera = True
+            self.listing = range(0, self.max_length)
+        elif Path(basedir).is_dir():
+            print('==> Processing image directory input: {}'.format(basedir))
+            self.listing = list(Path(basedir).glob(image_glob[0]))
+            for j in range(1, len(image_glob)):
+                image_path = list(Path(basedir).glob(image_glob[j]))
+                self.listing = self.listing + image_path
+            self.listing.sort()
+            self.listing = self.listing[::self.skip]
+            self.max_length = np.min([self.max_length, len(self.listing)])
+            if self.max_length == 0:
+                raise IOError('No images found (maybe bad \'image_glob\' ?)')
+            self.listing = self.listing[:self.max_length]
+            self.camera = False
+        elif Path(basedir).exists():
+            print('==> Processing video input: {}'.format(basedir))
+            self.cap = cv2.VideoCapture(basedir)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            num_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.listing = range(0, num_frames)
+            self.listing = self.listing[::self.skip]
+            self.video_file = True
+            self.max_length = np.min([self.max_length, len(self.listing)])
+            self.listing = self.listing[:self.max_length]
+        else:
+            raise ValueError('VideoStreamer input \"{}\" not recognized.'.format(basedir))
+        if self.camera and not self.cap.isOpened():
+            raise IOError('Could not read camera')
+
+    def next_frame(self):
+        """ Return the next frame, and increment internal counter.
+        Returns
+             image: Next H x W image.
+             status: True or False depending whether image was loaded.
+        """
+
+        if self.i == self.max_length:
+            return (None, False)
+        if self.camera:
+            if self._ip_camera:
+                #Wait for first image, making sure we haven't exited
+                while self._ip_grabbed is False and self._ip_exited is False:
+                    time.sleep(.001)
+
+                ret, image = self._ip_grabbed, self._ip_image.copy()
+                if ret is False:
+                    self._ip_running = False
+            else:
+                ret, image = self.cap.read()
+            if ret is False:
+                print('VideoStreamer: Cannot get image from camera')
+                return (None, False)
+            w, h = image.shape[1], image.shape[0]
+            if self.video_file:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.listing[self.i])
+    
+            if self.resize is not None:
+                image = resize_image(image, self.resize)
+            image = numpy_image_to_torch(image)
+            # print(" self.camera: image type {}, image shape {}".format(type(image), image.shape))
+        else:
+            image_file = str(self.listing[self.i])
+            image = load_image(image_file, self.resize)
+            # print("!self.camera: image type {}, image shape {}".format(type(image), image.shape))
+        self.i = self.i + 1
+        return (image, True)
+
+    def start_ip_camera_thread(self):
+        self._ip_thread = Thread(target=self.update_ip_camera, args=())
+        self._ip_running = True
+        self._ip_thread.start()
+        self._ip_exited = False
+        return self
+
+    def update_ip_camera(self):
+        while self._ip_running:
+            ret, img = self.cap.read()
+            if ret is False:
+                self._ip_running = False
+                self._ip_exited = True
+                self._ip_grabbed = False
+                return
+
+            self._ip_image = img
+            self._ip_grabbed = ret
+            self._ip_index += 1
+            #print('IPCAMERA THREAD got frame {}'.format(self._ip_index))
+
+
+    def cleanup(self):
+        self._ip_running = False

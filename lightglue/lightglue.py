@@ -409,7 +409,9 @@ class LightGlue(nn.Module):
         if features is not None:
             fname = f"{conf.weights}_{self.version.replace('.', '-')}.pth"
             state_dict = torch.hub.load_state_dict_from_url(
-                self.url.format(self.version, features), file_name=fname
+                self.url.format(self.version, features), file_name=fname,
+                model_dir = Path(__file__).parent / "weights",
+                progress = True
             )
             self.load_state_dict(state_dict, strict=False)
         elif conf.weights is not None:
